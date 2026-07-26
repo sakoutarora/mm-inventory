@@ -74,9 +74,17 @@ def handle_get_food_cost(event, _context):
         if closing_time <= opening_time:
             return json_response(400, {"message": "Closing update must be after opening update."})
 
-        # Build item quantity maps from snapshots
-        opening_snapshot = opening_update.get("snapshot", [])
-        closing_snapshot = closing_update.get("snapshot", [])
+        # Fetch full branch snapshots from inventory_snapshots collection
+        opening_snap_doc = db.inventory_snapshots.find_one({"updateId": opening_oid})
+        closing_snap_doc = db.inventory_snapshots.find_one({"updateId": closing_oid})
+
+        if not opening_snap_doc or not closing_snap_doc:
+            return json_response(400, {
+                "message": "Snapshot data not found for one or both updates. Run the snapshot migration first.",
+            })
+
+        opening_snapshot = opening_snap_doc.get("items", [])
+        closing_snapshot = closing_snap_doc.get("items", [])
 
         opening_by_item = {str(s["itemId"]): s for s in opening_snapshot}
         closing_by_item = {str(s["itemId"]): s for s in closing_snapshot}

@@ -39,3 +39,6 @@ def ensure_indexes(db):
     db.bills.create_index([("branchId", 1), ("billDate", -1)])
     db.bills.create_index([("supplierId", 1), ("billDate", -1)])
     db.bills.create_index([("branchId", 1), ("supplierId", 1), ("billDate", -1)])
+    # Inventory snapshots (full branch state per update, for food cost)
+    db.inventory_snapshots.create_index("updateId", unique=True)
+    db.inventory_snapshots.create_index([("branchId", 1), ("createdAt", -1)])

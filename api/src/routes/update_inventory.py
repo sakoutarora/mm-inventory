@@ -236,26 +236,6 @@ def handle_update_inventory(event, _context):
             except Exception:
                 submitted_at = now
 
-        # Build full branch snapshot: current state of ALL items for this branch
-        all_current = list(db.inventory_current.find({"branchId": branch["_id"]}))
-        snapshot_items = []
-        for cur in all_current:
-            item_doc_snap = db.items.find_one({"_id": cur["itemId"], "isActive": True})
-            if not item_doc_snap:
-                continue
-            snapshot_items.append({
-                "itemId": cur["itemId"],
-                "sku": item_doc_snap.get("sku"),
-                "name": item_doc_snap.get("name"),
-                "categoryId": item_doc_snap.get("categoryId"),
-                "quantity": cur.get("quantity"),
-                "unit": cur.get("unit"),
-                "quantityBase": cur.get("quantityBase"),
-                "baseUnit": cur.get("baseUnit"),
-                "inputQuantity": cur.get("inputQuantity"),
-                "inputUnit": cur.get("inputUnit"),
-            })
-
         update_doc = {
             "branchId": branch["_id"],
             "branchCode": branch["code"],
@@ -267,10 +247,34 @@ def handle_update_inventory(event, _context):
             "createdAt": now,
             "itemCount": len(batch_items),
             "items": batch_items,
-            "snapshot": snapshot_items,
         }
 
         insert_result = db.inventory_updates.insert_one(update_doc)
+
+        # Build full branch snapshot and store in separate collection
+        all_current = list(db.inventory_current.find({"branchId": branch["_id"]}))
+        snapshot_items = []
+        for cur in all_current:
+            item_doc_snap = db.items.find_one({"_id": cur["itemId"], "isActive": True})
+            if not item_doc_snap:
+                continue
+            snapshot_items.append({
+                "itemId": cur["itemId"],
+                "sku": item_doc_snap.get("sku"),
+                "name": item_doc_snap.get("name"),
+                "categoryId": item_doc_snap.get("categoryId"),
+                "quantityBase": cur.get("quantityBase"),
+                "baseUnit": cur.get("baseUnit"),
+                "quantity": cur.get("quantity"),
+                "unit": cur.get("unit"),
+            })
+
+        db.inventory_snapshots.insert_one({
+            "updateId": insert_result.inserted_id,
+            "branchId": branch["_id"],
+            "createdAt": now,
+            "items": snapshot_items,
+        })
 
         return json_response(
             200,
