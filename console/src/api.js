@@ -78,6 +78,11 @@ export const api = {
     return request(`/bills${qs ? `?${qs}` : ''}`, { token })
   },
   getBillDetail: (billId, token) => request(`/bills/${billId}`, { token }),
+  deleteBill: (billId, token) => request(`/bills/${billId}`, { method: 'DELETE', token }),
+  getDeletedBills: (params, token) => {
+    const qs = new URLSearchParams(params).toString()
+    return request(`/bills/deleted${qs ? `?${qs}` : ''}`, { token })
+  },
   getBillDownloadUrl: (billId, token) => request(`/bills/${billId}/download-url`, { token }),
 
   // Snapshots & Food Cost

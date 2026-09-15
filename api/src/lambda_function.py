@@ -23,6 +23,8 @@ from src.routes.bills import (
     handle_get_bill_detail,
     handle_get_bill_download_url,
     handle_update_bill,
+    handle_delete_bill,
+    handle_get_deleted_bills,
 )
 from src.routes.snapshots import handle_get_snapshots
 from src.routes.food_cost import handle_get_food_cost
@@ -81,7 +83,9 @@ _RAW_ROUTES = [
     ("POST",  "/api/v1/bills/parse-hyperpure",      handle_parse_hyperpure),
     ("POST",  "/api/v1/bills/confirm",               handle_confirm_bill),
     ("GET",   "/api/v1/bills",                       handle_get_bills),
+    ("GET",   "/api/v1/bills/deleted",               handle_get_deleted_bills),
     ("GET",   "/api/v1/bills/{billId}",              handle_get_bill_detail),
+    ("DELETE", "/api/v1/bills/{billId}",             handle_delete_bill),
     ("PATCH", "/api/v1/bills/{billId}",              handle_update_bill),
     ("GET",   "/api/v1/bills/{billId}/download-url", handle_get_bill_download_url),
     # Billing & Food Cost — Phase 3 (Food Cost)

@@ -31,6 +31,12 @@ _SUMMARY_DESCRIPTIONS = {"total"}
 # Serial-number header cells that mark the line-item table header row
 _INVOICE_HEADER_LABELS = frozenset({"s no.", "s no", "sl no.", "sl no", "si no.", "si no", "si\nno."})
 
+_CHALLAN_HEADER_LABELS = frozenset({"si no.", "si no", "sl no.", "sl no", "s.no", "s.no.", "si\nno."})
+
+# A tax-rate cell ("2.5+2.5+0+0"). Unmistakable, and used to align rows on
+# continuation pages that carry no header.
+_TAX_RATE_TOKEN = re.compile(r"^\d+(?:\.\d+)?(?:\+\d+(?:\.\d+)?)+$")
+
 # Category headers are rows where most cells are empty
 _CATEGORY_HEADER_PATTERN = re.compile(
     r"^(bakery|chocolates|dairy|frozen|instant|fruits|vegetables|sauces|seasoning|"
@@ -70,107 +76,56 @@ def parse_hyperpure_pdf(pdf_bytes: bytes) -> dict:
 
 
 def _parse_hyperpure_challan_pdf(pdf_bytes: bytes) -> dict:
-    """Parse a Hyperpure challan PDF and return structured bill data."""
+    """Parse a Hyperpure challan PDF and return structured bill data.
+
+    A challan can run onto further pages, which repeat no column header, so
+    rows there are aligned by their tax-rate cell instead of by a column map.
+    """
     pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
 
     if not pdf.pages:
         raise ValueError("PDF has no pages")
 
-    page = pdf.pages[0]
-    full_text = page.extract_text() or ""
-
-    # Extract bill metadata from header text
-    bill_meta = _extract_meta(full_text)
-
-    # Extract tables
-    tables = page.extract_tables()
-    if not tables:
-        raise ValueError("No tables found in PDF")
-
-    # Find the main line items table (usually the largest one)
-    main_table = max(tables, key=len)
+    # Metadata lives in the first page's header block
+    bill_meta = _extract_meta(pdf.pages[0].extract_text() or "")
 
     line_items = []
     ignored_lines = []
     duplicate_lines = []
     seen_rows = set()
     sl_no = 0
-
-    # Detect column layout from the header row
+    found_table = False
     col_map = None
-    for row in main_table:
-        if not row:
+
+    for page in pdf.pages:
+        tables = page.extract_tables()
+        if not tables:
             continue
-        cells = [str(c).strip().lower() if c else "" for c in row]
-        if any(c in ("si\nno.", "si no.", "sl no.", "sl no", "s.no", "s.no.") for c in cells):
-            col_map = _detect_column_map(cells)
-            break
+        found_table = True
 
-    for row in main_table:
-        if not row or all(not cell or not str(cell).strip() for cell in row):
-            continue
+        # Find the main line items table (usually the largest one)
+        main_table = max(tables, key=len)
 
-        # Clean cells — keep None positions as empty strings
-        cells = [str(c).strip() if c else "" for c in row]
-
-        # Skip header row
-        if cells[0].lower() in ("si no.", "si no", "sl no.", "sl no", "s.no", "s.no.", "si\nno."):
-            continue
-
-        # Skip category header rows (single text spanning the row)
-        non_empty = [c for c in cells if c]
-        if len(non_empty) <= 2:
-            combined = " ".join(non_empty)
-            if _CATEGORY_HEADER_PATTERN.match(combined):
+        # Detect column layout from the header row. Continuation pages have no
+        # header; they keep col_map as None so rows fall through to the
+        # tax-rate-anchored parser below.
+        page_col_map = None
+        for row in main_table:
+            if not row:
                 continue
-            # Also skip if it's clearly not a data row (no numbers)
-            if not any(c.replace(".", "").replace(",", "").isdigit() for c in non_empty):
-                continue
+            cells = [str(c).strip().lower() if c else "" for c in row]
+            if any(c in _CHALLAN_HEADER_LABELS for c in cells):
+                page_col_map = _detect_column_map(cells)
+                break
+        col_map = page_col_map
 
-        # Try to parse as a line item row
-        parsed = _parse_line_item_row(cells, col_map)
-        if not parsed:
-            continue
+        sl_no = _collect_challan_rows(
+            main_table, col_map, sl_no,
+            line_items, ignored_lines, duplicate_lines, seen_rows,
+        )
 
-        description_lower = parsed["description"].lower().strip()
-
-        # Skip summary rows (e.g. "Total") — not a charge, just a subtotal
-        if description_lower in _SUMMARY_DESCRIPTIONS:
-            continue
-
-        # Dedup before routing, so a repeated document cannot double-count a
-        # charge via ignoredLines either.
-        fingerprint = _row_fingerprint(parsed)
-        if fingerprint in seen_rows:
-            duplicate_lines.append({
-                "description": parsed["description"],
-                "quantity": parsed.get("quantity"),
-                "total": parsed.get("total", 0),
-                "reason": "Duplicate of an earlier line",
-            })
-            continue
-        seen_rows.add(fingerprint)
-
-        # Check exclusions
-        if description_lower in _EXCLUDED_DESCRIPTIONS:
-            ignored_lines.append({
-                "description": parsed["description"],
-                "total": parsed.get("total", 0),
-                "reason": "Non-inventory charge",
-            })
-            continue
-
-        if parsed.get("hsnCode") in _EXCLUDED_HSN:
-            ignored_lines.append({
-                "description": parsed["description"],
-                "total": parsed.get("total", 0),
-                "reason": "Non-inventory charge",
-            })
-            continue
-
-        sl_no += 1
-        parsed["slNo"] = sl_no
-        line_items.append(parsed)
+    if not found_table:
+        raise ValueError("No tables found in PDF")
 
     # Calculate totals (grandTotal includes non-inventory charges like delivery, TCS)
     items_total = sum(i.get("total", 0) for i in line_items)
@@ -193,6 +148,164 @@ def _parse_hyperpure_challan_pdf(pdf_bytes: bytes) -> dict:
         "ignoredLines": ignored_lines,
         "duplicateLines": duplicate_lines,
         "totals": totals,
+    }
+
+
+def _collect_challan_rows(
+    table: list[list],
+    col_map: dict | None,
+    sl_no: int,
+    line_items: list[dict],
+    ignored_lines: list[dict],
+    duplicate_lines: list[dict],
+    seen_rows: set,
+) -> int:
+    """Parse one challan page's table, appending in place. Returns the new slNo."""
+    for row in table:
+        if not row or all(not cell or not str(cell).strip() for cell in row):
+            continue
+
+        # Clean cells — keep None positions as empty strings
+        cells = [str(c).strip() if c else "" for c in row]
+
+        # Skip header row
+        if cells[0].lower() in _CHALLAN_HEADER_LABELS:
+            continue
+
+        # Skip category header rows (single text spanning the row)
+        non_empty = [c for c in cells if c]
+        if len(non_empty) <= 2:
+            combined = " ".join(non_empty)
+            if _CATEGORY_HEADER_PATTERN.match(combined):
+                continue
+            # Also skip if it's clearly not a data row (no numbers)
+            if not any(c.replace(".", "").replace(",", "").isdigit() for c in non_empty):
+                continue
+
+        # With a header use its column map; a continuation page has none, so
+        # fall back to anchoring the row on its tax-rate cell.
+        if col_map:
+            parsed = _parse_line_item_row(cells, col_map)
+        else:
+            parsed = _parse_continuation_line_item_row(cells)
+        if not parsed:
+            continue
+
+        description_lower = parsed["description"].lower().strip()
+
+        # Skip summary rows (e.g. "Total") — not a charge, just a subtotal
+        if description_lower in _SUMMARY_DESCRIPTIONS:
+            continue
+
+        # Dedup before routing, so a repeated document cannot double-count a
+        # charge via ignoredLines either.
+        fingerprint = _row_fingerprint(parsed)
+        if fingerprint in seen_rows:
+            duplicate_lines.append({
+                "description": parsed["description"],
+                "quantity": parsed.get("quantity"),
+                "total": parsed.get("total", 0),
+                "reason": "Duplicate of an earlier line",
+            })
+            continue
+        seen_rows.add(fingerprint)
+
+        if description_lower in _EXCLUDED_DESCRIPTIONS or parsed.get("hsnCode") in _EXCLUDED_HSN:
+            ignored_lines.append({
+                "description": parsed["description"],
+                "total": parsed.get("total", 0),
+                "reason": "Non-inventory charge",
+            })
+            continue
+
+        sl_no += 1
+        parsed["slNo"] = sl_no
+        line_items.append(parsed)
+
+    return sl_no
+
+
+def _is_numeric_cell(cell: str) -> bool:
+    try:
+        float(cell.replace(",", "").replace(" ", "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_continuation_line_item_row(cells: list[str]) -> dict | None:
+    """Parse a challan row on a page that carries no column header.
+
+    A challan that overflows onto a second page repeats no header, and
+    pdfplumber infers a different column count from the sparser content, so the
+    first page's column map does not transfer (it produced 18 columns against
+    the header page's 15 on a real bill). The tax-rate cell is unambiguous
+    though, so it anchors the row and every other field is read as an offset
+    from it. Rows with no such cell - the totals line, the tax summary, the
+    declaration - simply fail to parse, which is the behaviour we want.
+    """
+    non_empty = [c for c in cells if c]
+
+    anchor = None
+    for i, c in enumerate(non_empty):
+        if _TAX_RATE_TOKEN.match(re.sub(r"\s+", "", c)):
+            anchor = i
+            break
+
+    # Need description/HSN/qty/price to the left and tax amount/total to the right.
+    if anchor is None or anchor < 4 or anchor + 2 >= len(non_empty):
+        return None
+
+    def to_float(cell):
+        try:
+            return float(cell.replace(",", "").replace(" ", "").strip())
+        except (ValueError, AttributeError):
+            return 0.0
+
+    taxable_amount = to_float(non_empty[anchor - 1])
+    discount = to_float(non_empty[anchor - 2])
+    pre_tax_total = to_float(non_empty[anchor - 3])
+
+    # UoM is the only non-numeric field in that run. Charge rows (delivery,
+    # transaction fee) carry no unit at all, which shifts everything left of
+    # it by one.
+    maybe_uom = non_empty[anchor - 4]
+    if _is_numeric_cell(maybe_uom):
+        uom = ""
+        price_idx = anchor - 4
+    else:
+        uom = maybe_uom.strip()
+        price_idx = anchor - 5
+
+    if price_idx - 3 < 0:
+        return None
+
+    unit_price = to_float(non_empty[price_idx])
+    quantity = to_float(non_empty[price_idx - 1])
+    hsn_code = re.sub(r"\s+", "", non_empty[price_idx - 2])
+    description = non_empty[price_idx - 3]
+
+    if not description or len(description) < 3:
+        return None
+
+    tax_amount = to_float(non_empty[anchor + 1])
+    total = to_float(non_empty[anchor + 2])
+
+    if quantity == 0 and unit_price == 0 and total == 0:
+        return None
+
+    return {
+        "description": description.strip(),
+        "hsnCode": hsn_code if hsn_code else None,
+        "quantity": quantity,
+        "unitPrice": unit_price,
+        "uom": uom if uom else None,
+        "preTaxTotal": pre_tax_total,
+        "discount": discount,
+        "taxableAmount": taxable_amount,
+        "taxRate": _parse_tax_rate(re.sub(r"\s+", "", non_empty[anchor])),
+        "taxAmount": tax_amount,
+        "total": total,
     }
 
 

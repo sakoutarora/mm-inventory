@@ -94,11 +94,17 @@ functions:
           path: /api/v1/bills
           method: get
       - httpApi:
+          path: /api/v1/bills/deleted
+          method: get
+      - httpApi:
           path: /api/v1/bills/{billId}
           method: get
       - httpApi:
           path: /api/v1/bills/{billId}
           method: patch
+      - httpApi:
+          path: /api/v1/bills/{billId}
+          method: delete
       - httpApi:
           path: /api/v1/bills/{billId}/download-url
           method: get

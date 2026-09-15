@@ -47,6 +47,29 @@ def run():
     )
     print("  idx_bills_supplierid")
 
+    # ---- deleted_bills collection (archive for deleted bills) ----
+    print("Creating indexes on 'deleted_bills'...")
+
+    # Listing the archive: branch + most recently deleted first
+    db.deleted_bills.create_index(
+        [("branchId", ASCENDING), ("deletedAt", DESCENDING)],
+        name="idx_deleted_bills_branch_deletedat",
+    )
+    print("  idx_deleted_bills_branch_deletedat (archive listing)")
+
+    # Date-range and supplier filters mirror the active bills listing
+    db.deleted_bills.create_index(
+        [("branchId", ASCENDING), ("billDate", DESCENDING)],
+        name="idx_deleted_bills_branch_billdate",
+    )
+    print("  idx_deleted_bills_branch_billdate")
+
+    db.deleted_bills.create_index(
+        [("supplierId", ASCENDING)],
+        name="idx_deleted_bills_supplierid",
+    )
+    print("  idx_deleted_bills_supplierid")
+
     # ---- bill_item_mappings collection ----
     print("Creating indexes on 'bill_item_mappings'...")
 

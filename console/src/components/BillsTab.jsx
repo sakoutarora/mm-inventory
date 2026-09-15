@@ -56,6 +56,11 @@ export default function BillsTab({ session, onNavigate }) {
   const [expandedBillId, setExpandedBillId] = useState(null)
   const [billDetail, setBillDetail] = useState(null)
 
+  // Deleted bills view + delete confirmation
+  const [showDeleted, setShowDeleted] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState(null) // bill row pending confirmation
+  const [deleting, setDeleting] = useState(false)
+
   // Suggestion fetch tracking
   const suggestionsRequested = useRef(false)
   const suggestionsCancelled = useRef(false)
@@ -153,9 +158,11 @@ export default function BillsTab({ session, onNavigate }) {
     }
   }
 
-  async function loadBills(filters) {
+  async function loadBills(filters, deletedOverride) {
     setLoading(true)
     setError('')
+    // showDeleted may not have flushed yet when the toggle triggers this call.
+    const deleted = deletedOverride === undefined ? showDeleted : deletedOverride
     try {
       const params = { branchCode: session.branchCode }
       const f = filters || {}
@@ -163,7 +170,9 @@ export default function BillsTab({ session, onNavigate }) {
       if (f.dateTo || filterDateTo) params.dateTo = f.dateTo || filterDateTo
       if ((f.source || filterSource) !== 'all') params.source = f.source || filterSource
       if (f.supplierId || filterSupplier) params.supplierId = f.supplierId || filterSupplier
-      const data = await api.getBills(params, session.token)
+      const data = deleted
+        ? await api.getDeletedBills(params, session.token)
+        : await api.getBills(params, session.token)
       setBills(data.bills || [])
     } catch (err) {
       setError(err.message)
@@ -669,6 +678,36 @@ export default function BillsTab({ session, onNavigate }) {
     } catch (err) {
       setError(err.message)
     }
+  }
+
+  // ---- Delete ----
+  async function confirmDeleteBill() {
+    if (!deleteTarget) return
+    setDeleting(true)
+    setError('')
+    try {
+      await api.deleteBill(deleteTarget.id, session.token)
+      setDeleteTarget(null)
+      if (expandedBillId === deleteTarget.id) {
+        setExpandedBillId(null)
+        setBillDetail(null)
+      }
+      setToast({ type: 'success', message: 'Bill deleted' })
+      await loadBills()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  function toggleDeletedView() {
+    const next = !showDeleted
+    setShowDeleted(next)
+    setExpandedBillId(null)
+    setBillDetail(null)
+    setDeleteTarget(null)
+    loadBills(null, next)
   }
 
   // ---- Helpers ----
@@ -1201,13 +1240,20 @@ export default function BillsTab({ session, onNavigate }) {
       {toast && <div className={`app-toast ${toast.type}`}>{toast.message}</div>}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
-        <h3 style={{ margin: 0 }}>Bills</h3>
+        <h3 style={{ margin: 0 }}>{showDeleted ? 'Deleted Bills' : 'Bills'}</h3>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn-primary" onClick={() => { setError(''); history.pushState({ billsView: 'upload' }, ''); setView('upload') }}>
-            Upload Hyperpure PDF
-          </button>
-          <button className="btn-secondary" onClick={() => { setError(''); openManualEntry() }}>
-            + Add Manual Bill
+          {!showDeleted && (
+            <>
+              <button className="btn-primary" onClick={() => { setError(''); history.pushState({ billsView: 'upload' }, ''); setView('upload') }}>
+                Upload Hyperpure PDF
+              </button>
+              <button className="btn-secondary" onClick={() => { setError(''); openManualEntry() }}>
+                + Add Manual Bill
+              </button>
+            </>
+          )}
+          <button className="btn-secondary" onClick={toggleDeletedView}>
+            {showDeleted ? 'Back to Active Bills' : 'Show Deleted Bills'}
           </button>
         </div>
       </div>
@@ -1251,7 +1297,9 @@ export default function BillsTab({ session, onNavigate }) {
         </div>
       ) : bills.length === 0 ? (
         <div className="empty-state">
-          No bills uploaded yet. Upload a Hyperpure challan or enter a bill manually to get started.
+          {showDeleted
+            ? 'No deleted bills.'
+            : 'No bills uploaded yet. Upload a Hyperpure challan or enter a bill manually to get started.'}
         </div>
       ) : (
         <div className="table-wrap">
@@ -1259,7 +1307,9 @@ export default function BillsTab({ session, onNavigate }) {
             <thead>
               <tr>
                 <th>Date</th><th>Bill # / Order #</th><th>Supplier</th><th>Source</th>
-                <th>Items</th><th>Total ({'\u20B9'})</th><th>Actions</th>
+                <th>Items</th><th>Total ({'\u20B9'})</th>
+                {showDeleted && <th>Deleted</th>}
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1272,17 +1322,30 @@ export default function BillsTab({ session, onNavigate }) {
                     <td><span className={`badge-${bill.source === 'hyperpure' ? 'info' : 'default'}`}>{bill.source === 'hyperpure' ? 'HP' : 'Manual'}</span></td>
                     <td>{bill.itemCount} items</td>
                     <td>{'\u20B9'}{bill.grandTotal?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                    {showDeleted && (
+                      <td>
+                        {bill.deletedAt ? new Date(bill.deletedAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '\u2013'}
+                        {bill.deletedByName ? <div style={{ fontSize: 12, color: 'var(--muted)' }}>{bill.deletedByName}</div> : null}
+                      </td>
+                    )}
                     <td>
                       <div style={{ display: 'flex', gap: 6 }}>
                         <button className="btn-small btn-secondary" onClick={() => toggleBillDetail(bill.id)}>
                           {expandedBillId === bill.id ? 'Hide' : 'View'}
                         </button>
-                        <button className="btn-small btn-secondary" onClick={() => startEditBill(bill.id)}>
-                          Edit
-                        </button>
+                        {!showDeleted && (
+                          <button className="btn-small btn-secondary" onClick={() => startEditBill(bill.id)}>
+                            Edit
+                          </button>
+                        )}
                         {bill.hasFile && (
                           <button className="btn-small btn-secondary" onClick={() => downloadBill(bill.id)}>
                             Download
+                          </button>
+                        )}
+                        {!showDeleted && (
+                          <button className="btn-small btn-secondary" style={{ color: '#dc2626' }} onClick={() => setDeleteTarget(bill)}>
+                            Delete
                           </button>
                         )}
                       </div>
@@ -1290,7 +1353,7 @@ export default function BillsTab({ session, onNavigate }) {
                   </tr>
                   {expandedBillId === bill.id && billDetail && (
                     <tr>
-                      <td colSpan={7} style={{ padding: 16, background: '#f8fafc' }}>
+                      <td colSpan={showDeleted ? 8 : 7} style={{ padding: 16, background: '#f8fafc' }}>
                         <div className="table-wrap">
                           <table>
                             <thead>
@@ -1321,6 +1384,39 @@ export default function BillsTab({ session, onNavigate }) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Delete confirmation */}
+      {deleteTarget && (
+        <div className="quick-add-overlay" onClick={() => { if (!deleting) setDeleteTarget(null) }}>
+          <div className="quick-add-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="quick-add-header">
+              <h4 style={{ margin: 0 }}>Delete Bill?</h4>
+              <button className="searchable-select-clear" onClick={() => { if (!deleting) setDeleteTarget(null) }} style={{ fontSize: 16 }}>&#10005;</button>
+            </div>
+            <div className="quick-add-body">
+              <p style={{ margin: 0 }}>
+                Are you sure you want to delete this bill? It will be moved to Deleted Bills and
+                removed from food cost calculations.
+              </p>
+              <div className="banner warning">
+                <strong>{deleteTarget.supplierName || 'Unknown supplier'}</strong>
+                {' \u2014 '}
+                {deleteTarget.orderNo || deleteTarget.billNumber || 'No bill number'}
+                {' \u2014 '}
+                {'\u20B9'}{deleteTarget.grandTotal?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                {' \u2014 '}
+                {deleteTarget.itemCount} items
+              </div>
+            </div>
+            <div className="quick-add-footer">
+              <button className="btn-secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancel</button>
+              <button className="btn-primary" style={{ background: '#dc2626', borderColor: '#dc2626' }} disabled={deleting} onClick={confirmDeleteBill}>
+                {deleting ? 'Deleting...' : 'Yes, Delete'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>

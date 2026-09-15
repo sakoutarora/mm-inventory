@@ -447,6 +447,9 @@ def handle_get_bill_detail(event, _context):
         db = get_db()
         bill = db.bills.find_one({"_id": bill_oid})
         if not bill:
+            # Deleted bills stay viewable from the archive.
+            bill = db.deleted_bills.find_one({"_id": bill_oid})
+        if not bill:
             return json_response(404, {"message": "Bill not found."})
 
         # Get supplier name
@@ -543,6 +546,9 @@ def handle_get_bill_download_url(event, _context):
 
         db = get_db()
         bill = db.bills.find_one({"_id": bill_oid}, {"s3Key": 1})
+        if not bill:
+            # The S3 file is kept on delete, so archived bills stay downloadable.
+            bill = db.deleted_bills.find_one({"_id": bill_oid}, {"s3Key": 1})
         if not bill:
             return json_response(404, {"message": "Bill not found."})
 
@@ -840,3 +846,160 @@ def _find_mapping_suggestion(db, description: str, hsn_code: str | None) -> dict
         "source": "none",
         "existingConversion": None,
     }
+
+
+def handle_delete_bill(event, _context):
+    """DELETE /bills/:billId — move a bill into the deleted_bills collection."""
+    try:
+        token = extract_bearer_token(event)
+        if not token:
+            return json_response(401, {"message": "Missing bearer token."})
+
+        try:
+            auth = verify_token(token)
+        except Exception:
+            return json_response(401, {"message": "Invalid token."})
+
+        if auth.get("role") != "admin":
+            return json_response(403, {"message": "Admin access required."})
+
+        path_params = event.get("pathParameters") or {}
+        bill_id = path_params.get("billId")
+        if not bill_id:
+            return json_response(400, {"message": "billId is required."})
+
+        try:
+            bill_oid = ObjectId(bill_id)
+        except Exception:
+            return json_response(400, {"message": "Invalid billId."})
+
+        db = get_db()
+        bill = db.bills.find_one({"_id": bill_oid})
+        if not bill:
+            return json_response(404, {"message": "Bill not found."})
+
+        now = datetime.now(timezone.utc)
+        archived = dict(bill)
+        archived["status"] = "deleted"
+        archived["deletedAt"] = now
+        archived["deletedBy"] = ObjectId(auth["userId"])
+
+        # Insert into the archive first, so a failure here leaves the bill intact.
+        try:
+            db.deleted_bills.insert_one(archived)
+        except DuplicateKeyError:
+            # Already archived by an earlier attempt that failed before the delete.
+            pass
+
+        db.bills.delete_one({"_id": bill_oid})
+
+        return json_response(200, {
+            "message": "Bill deleted.",
+            "billId": str(bill_oid),
+        })
+
+    except Exception as exc:
+        print("delete_bill error", exc)
+        return json_response(500, {"message": "Internal server error."})
+
+
+def handle_get_deleted_bills(event, _context):
+    """GET /bills/deleted — list bills that were moved to the archive."""
+    try:
+        token = extract_bearer_token(event)
+        if not token:
+            return json_response(401, {"message": "Missing bearer token."})
+
+        try:
+            auth = verify_token(token)
+        except Exception:
+            return json_response(401, {"message": "Invalid token."})
+
+        if auth.get("role") != "admin":
+            return json_response(403, {"message": "Admin access required."})
+
+        qs = event.get("queryStringParameters") or {}
+        branch_code = (qs.get("branchCode") or "").strip().upper()
+        date_from = qs.get("dateFrom")
+        date_to = qs.get("dateTo")
+        supplier_id = qs.get("supplierId")
+        source = qs.get("source")
+        limit = min(int(qs.get("limit", 50)), 200)
+        skip = int(qs.get("skip", 0))
+
+        db = get_db()
+        query = {}
+
+        if branch_code:
+            branch = db.branches.find_one({"code": branch_code})
+            if branch:
+                query["branchId"] = branch["_id"]
+
+        if date_from or date_to:
+            date_q = {}
+            if date_from:
+                try:
+                    date_q["$gte"] = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            if date_to:
+                try:
+                    date_q["$lte"] = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            if date_q:
+                query["billDate"] = date_q
+
+        if supplier_id:
+            try:
+                query["supplierId"] = ObjectId(supplier_id)
+            except Exception:
+                pass
+
+        if source and source in ("hyperpure", "generic"):
+            query["source"] = source
+
+        bills = list(
+            db.deleted_bills.find(query)
+            .sort("deletedAt", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+        total_count = db.deleted_bills.count_documents(query)
+
+        supplier_ids = list({b["supplierId"] for b in bills if b.get("supplierId")})
+        suppliers = {str(s["_id"]): s["name"] for s in db.suppliers.find({"_id": {"$in": supplier_ids}})}
+
+        deleter_ids = list({b["deletedBy"] for b in bills if b.get("deletedBy")})
+        deleters = {
+            str(u["_id"]): u.get("fullName") or u.get("username") or ""
+            for u in db.users.find({"_id": {"$in": deleter_ids}}, {"fullName": 1, "username": 1})
+        }
+
+        return json_response(200, {
+            "bills": [
+                {
+                    "id": str(b["_id"]),
+                    "branchCode": b.get("branchCode"),
+                    "supplierName": suppliers.get(str(b.get("supplierId")), ""),
+                    "supplierId": str(b["supplierId"]) if b.get("supplierId") else None,
+                    "source": b.get("source"),
+                    "orderNo": b.get("orderNo"),
+                    "billNumber": b.get("billNumber"),
+                    "billDate": b.get("billDate"),
+                    "grandTotal": b.get("grandTotal"),
+                    "itemCount": len(b.get("lineItems", [])),
+                    "paymentStatus": b.get("paymentStatus"),
+                    "hasFile": bool(b.get("s3Key")),
+                    "createdAt": b.get("createdAt"),
+                    "deletedAt": b.get("deletedAt"),
+                    "deletedByName": deleters.get(str(b.get("deletedBy")), ""),
+                }
+                for b in bills
+            ],
+            "totalCount": total_count,
+        })
+
+    except Exception as exc:
+        print("get_deleted_bills error", exc)
+        return json_response(500, {"message": "Internal server error."})

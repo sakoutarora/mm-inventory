@@ -535,9 +535,24 @@ GET /bills?branchCode=GGN01&dateFrom=2026-07-01&dateTo=2026-07-22&supplierId=X&s
 
 GET /bills/:billId
   Returns: { bill, s3DownloadUrl }
+  Falls back to `deleted_bills` if not found in `bills`, so archived bills stay viewable.
 
 GET /bills/:billId/download-url
   Returns: { url: "https://s3...presigned" }
+  Same archive fallback — the S3 file is never removed on delete.
+
+DELETE /bills/:billId                                        [admin only]
+  Moves the bill document from `bills` into `deleted_bills`, stamping
+  status: "deleted", deletedAt and deletedBy. The S3 file is left in place.
+  Returns: { message, billId }
+  Note: the bill disappears from GET /bills and from food cost automatically,
+  since food cost queries `bills` with status: "confirmed". Deletion is final —
+  there is no restore endpoint; the archive is for audit only.
+
+GET /bills/deleted?branchCode=GGN01&dateFrom=...&dateTo=...  [admin only]
+  Same filters and response shape as GET /bills, sorted by deletedAt desc,
+  with deletedAt and deletedByName added per row.
+  Returns: { bills: [...], totalCount }
 ```
 
 ### Suppliers
