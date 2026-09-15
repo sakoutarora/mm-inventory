@@ -58,9 +58,10 @@ export default function BillsTab({ session, onNavigate }) {
 
   // Suggestion fetch tracking
   const suggestionsRequested = useRef(false)
+  const suggestionsCancelled = useRef(false)
 
   // Quick-add item modal
-  const [quickAdd, setQuickAdd] = useState(null) // { lineItemIdx, prefillName }
+  const [quickAdd, setQuickAdd] = useState(null) // { lineItemUid, prefillName }
   const [quickAddForm, setQuickAddForm] = useState({ name: '', sku: '', defaultUnit: 'pcs', categoryCode: '', minThreshold: '0' })
   const [quickAddBusy, setQuickAddBusy] = useState(false)
   const [categories, setCategories] = useState([])
@@ -91,17 +92,22 @@ export default function BillsTab({ session, onNavigate }) {
   useEffect(() => {
     if (!reviewData || !inventoryItems.length || suggestionsRequested.current) return
     const unmapped = reviewData.lineItems
-      .map((li, idx) => ({ idx, description: li.description }))
-      .filter((x) => x.description && !reviewData.lineItems[x.idx].inventoryItemId)
+      .filter((li) => li.description && !li.inventoryItemId)
+      .map((li) => ({ uid: li._uid, description: li.description }))
     if (!unmapped.length) return
 
     suggestionsRequested.current = true
-    let cancelled = false
+    // Results are matched back by row uid, not by array position: the user can
+    // delete or map a row while these requests are in flight, which shifts
+    // every index after it. Cancellation is deliberately tied to unmount only
+    // — this effect re-runs on every reviewData change, and cancelling there
+    // would throw away the suggestions for all the other rows.
+    suggestionsCancelled.current = false
     async function fetchSuggestions() {
       const results = await Promise.allSettled(
         unmapped.map((u) => api.suggestMapping(u.description, session.token))
       )
-      if (cancelled) return
+      if (suggestionsCancelled.current) return
       setReviewData((prev) => {
         if (!prev) return prev
         const items = [...prev.lineItems]
@@ -110,7 +116,8 @@ export default function BillsTab({ session, onNavigate }) {
           const { suggestions, parsed } = result.value
           const top = suggestions?.[0]
           if (!top || top.confidence === 'low') return
-          const lineIdx = unmapped[i].idx
+          const lineIdx = items.findIndex((li) => li._uid === unmapped[i].uid)
+          if (lineIdx === -1) return // row was deleted while the request was in flight
           if (items[lineIdx].inventoryItemId) return // already mapped
 
           const invItem = inventoryItems.find((it) => it.id === top.inventoryItemId)
@@ -134,8 +141,9 @@ export default function BillsTab({ session, onNavigate }) {
       })
     }
     fetchSuggestions()
-    return () => { cancelled = true }
   }, [reviewData, inventoryItems.length])
+
+  useEffect(() => () => { suggestionsCancelled.current = true }, [])
 
   function emptyLineItem() {
     return {
@@ -191,7 +199,7 @@ export default function BillsTab({ session, onNavigate }) {
   }
 
   // ---- Quick-add item ----
-  function openQuickAdd(lineItemIdx, prefillName) {
+  function openQuickAdd(lineItemUid, prefillName) {
     if (!categories.length) {
       api.getAdminMeta(session.token).then((data) => {
         setCategories(data.categories || [])
@@ -204,7 +212,7 @@ export default function BillsTab({ session, onNavigate }) {
       .replace(/\s+/g, '-')
       .slice(0, 20)
     setQuickAddForm({ name: prefillName, sku, defaultUnit: 'pcs', categoryCode: '', minThreshold: '0' })
-    setQuickAdd({ lineItemIdx, prefillName })
+    setQuickAdd({ lineItemUid, prefillName })
   }
 
   async function submitQuickAdd() {
@@ -225,7 +233,7 @@ export default function BillsTab({ session, onNavigate }) {
       const newItem = inventoryItems.find((i) => i.sku === quickAddForm.sku)
         || (await api.getItemPricing(session.token)).items?.find((i) => i.sku === quickAddForm.sku)
       if (newItem && quickAdd) {
-        updateReviewItem(quickAdd.lineItemIdx, 'inventoryItemId', newItem.id)
+        updateReviewItemByUid(quickAdd.lineItemUid, 'inventoryItemId', newItem.id)
         // Refresh the items list so the new item shows
         const refreshed = await api.getItemPricing(session.token)
         setInventoryItems(refreshed.items || [])
@@ -237,6 +245,15 @@ export default function BillsTab({ session, onNavigate }) {
     } finally {
       setQuickAddBusy(false)
     }
+  }
+
+  // Stable per-row identity. Review rows are reorderable (a row can be
+  // deleted), so an array index is not a safe React key — SearchableSelect
+  // keeps internal search state that would leak to the row taking that slot.
+  const reviewRowUid = useRef(0)
+  function nextRowUid() {
+    reviewRowUid.current += 1
+    return `row-${reviewRowUid.current}`
   }
 
   // ---- Helper: find saved conversion for item+unit ----
@@ -261,6 +278,7 @@ export default function BillsTab({ session, onNavigate }) {
         const mappedItem = mappedItemId ? inventoryItems.find((i) => i.id === mappedItemId) : null
         return {
           ...li,
+          _uid: nextRowUid(),
           inventoryItemId: mappedItemId,
           inventoryItemName: li.suggestedMapping?.inventoryItemName || '',
           confidence: li.suggestedMapping?.confidence || 'none',
@@ -280,6 +298,7 @@ export default function BillsTab({ session, onNavigate }) {
         paymentStatus: result.billMeta?.paymentStatus || 'unpaid',
         lineItems: reviewItems,
         ignoredLines: result.ignoredLines || [],
+        duplicateLines: result.duplicateLines || [],
         totals: result.totals || {},
       })
       setEditingBillId(null)
@@ -395,6 +414,7 @@ export default function BillsTab({ session, onNavigate }) {
         conversionToUnit: mappedItem?.baseUnit || '',
         saveGlobalMapping: true,
         _mappedBaseUnit: mappedItem?.baseUnit || '',
+        _uid: nextRowUid(),
       }
     })
 
@@ -432,6 +452,7 @@ export default function BillsTab({ session, onNavigate }) {
       const reviewItems = (bill.lineItems || []).map((li) => {
         const mappedItem = li.inventoryItemId ? inventoryItems.find((i) => i.id === li.inventoryItemId) : null
         return {
+          _uid: nextRowUid(),
           slNo: li.slNo,
           description: li.description,
           hsnCode: li.hsnCode,
@@ -482,33 +503,78 @@ export default function BillsTab({ session, onNavigate }) {
   }
 
   // ---- Confirm / Update Bill ----
-  function updateReviewItem(idx, field, value) {
+  // Totals come from the PDF, so they must be recomputed whenever a parsed
+  // row is removed — otherwise the saved grand total includes deleted items.
+  function recalcTotals(items, prevTotals) {
+    const round2 = (n) => Math.round(n * 100) / 100
+    const sum = (field) => round2(items.reduce((acc, li) => acc + (Number(li[field]) || 0), 0))
+    const itemsTotal = sum('total')
+    const otherCharges = round2(Number(prevTotals?.otherCharges) || 0)
+    return {
+      ...prevTotals,
+      subtotal: sum('preTaxTotal'),
+      totalDiscount: sum('discount'),
+      taxableAmount: sum('taxableAmount'),
+      taxAmount: sum('taxAmount'),
+      itemsTotal,
+      otherCharges,
+      grandTotal: round2(itemsTotal + otherCharges),
+    }
+  }
+
+  function removeReviewItem(idx) {
     setReviewData((prev) => {
-      const items = [...prev.lineItems]
-      items[idx] = { ...items[idx], [field]: value }
-      if (field === 'inventoryItemId') {
-        const found = inventoryItems.find((i) => i.id === value)
-        items[idx].inventoryItemName = found?.name || ''
-        items[idx].confidence = value ? 'high' : 'none'
-        items[idx]._mappedBaseUnit = found?.baseUnit || ''
-        items[idx].conversionToUnit = found?.baseUnit || ''
-        // Auto-fill saved conversion
-        if (value && items[idx].uom) {
-          const mismatch = found && getUnitFamily(items[idx].uom) !== getUnitFamily(found.baseUnit)
-          if (mismatch) {
-            const saved = getSavedConversion(value, items[idx].uom)
-            if (saved) items[idx].conversionFactor = saved
-          } else {
-            items[idx].conversionFactor = 1
-          }
+      const items = prev.lineItems
+        .filter((_, i) => i !== idx)
+        .map((li, i) => ({ ...li, slNo: i + 1 }))
+      return { ...prev, lineItems: items, totals: recalcTotals(items, prev.totals) }
+    })
+  }
+
+  // For callers that resolve after an await: the row may have moved or been
+  // deleted since, so look it up by uid rather than trusting a stale index.
+  function updateReviewItemByUid(uid, field, value) {
+    setReviewData((prev) => {
+      if (!prev) return prev
+      const idx = prev.lineItems.findIndex((li) => li._uid === uid)
+      if (idx === -1) return prev
+      return applyReviewItemChange(prev, idx, field, value)
+    })
+  }
+
+  function updateReviewItem(idx, field, value) {
+    setReviewData((prev) => applyReviewItemChange(prev, idx, field, value))
+  }
+
+  function applyReviewItemChange(prev, idx, field, value) {
+    const items = [...prev.lineItems]
+    items[idx] = { ...items[idx], [field]: value }
+    if (field === 'inventoryItemId') {
+      const found = inventoryItems.find((i) => i.id === value)
+      items[idx].inventoryItemName = found?.name || ''
+      items[idx].confidence = value ? 'high' : 'none'
+      items[idx]._mappedBaseUnit = found?.baseUnit || ''
+      items[idx].conversionToUnit = found?.baseUnit || ''
+      // Auto-fill saved conversion
+      if (value && items[idx].uom) {
+        const mismatch = found && getUnitFamily(items[idx].uom) !== getUnitFamily(found.baseUnit)
+        if (mismatch) {
+          const saved = getSavedConversion(value, items[idx].uom)
+          if (saved) items[idx].conversionFactor = saved
+        } else {
+          items[idx].conversionFactor = 1
         }
       }
-      return { ...prev, lineItems: items }
-    })
+    }
+    return { ...prev, lineItems: items }
   }
 
   async function confirmBill() {
     if (!reviewData) return
+    if (!reviewData.lineItems.length) {
+      setError('This bill has no line items. Add at least one item before saving.')
+      return
+    }
     const unmapped = reviewData.lineItems.filter((li) => !li.inventoryItemId)
     if (unmapped.length) {
       setError(`${unmapped.length} item(s) are not mapped to inventory. Map all items before saving.`)
@@ -938,7 +1004,7 @@ export default function BillsTab({ session, onNavigate }) {
             const hasFamilyMismatch = isMapped && hasUnitMismatch(li.uom, li._mappedBaseUnit)
 
             return (
-              <div key={idx} className={`review-item-card ${isMapped ? 'mapped' : 'unmapped'}`}>
+              <div key={li._uid || idx} className={`review-item-card ${isMapped ? 'mapped' : 'unmapped'}`}>
                 {/* Main row */}
                 <div className="review-item-top">
                   <div className="review-item-num">{li.slNo}</div>
@@ -965,6 +1031,15 @@ export default function BillsTab({ session, onNavigate }) {
                   <div className="review-item-total">
                     {'\u20B9'}{li.total?.toFixed?.(2) ?? li.total}
                   </div>
+                  <button
+                    type="button"
+                    className="review-item-remove"
+                    onClick={() => removeReviewItem(idx)}
+                    title="Remove this row from the bill"
+                    aria-label={`Remove ${li.description?.replace(/\n/g, ' ') || 'line item'}`}
+                  >
+                    &#10005;
+                  </button>
                 </div>
 
                 {/* Mapping section */}
@@ -979,7 +1054,7 @@ export default function BillsTab({ session, onNavigate }) {
                         value={li.inventoryItemId || ''}
                         onChange={(val) => updateReviewItem(idx, 'inventoryItemId', val)}
                         placeholder="Search inventory item to map..."
-                        onCreateNew={(name) => openQuickAdd(idx, name || li.description?.replace(/\n/g, ' ') || '')}
+                        onCreateNew={(name) => openQuickAdd(li._uid, name || li.description?.replace(/\n/g, ' ') || '')}
                       />
                     </div>
                   </div>
@@ -1027,6 +1102,17 @@ export default function BillsTab({ session, onNavigate }) {
           })}
         </div>
 
+        {reviewData.duplicateLines?.length > 0 && (
+          <div className="excluded-lines duplicate-lines">
+            <strong>Duplicates removed ({reviewData.duplicateLines.length}):</strong>
+            {reviewData.duplicateLines.map((dl, i) => (
+              <span key={i} className="excluded-item">
+                {dl.description?.replace(/\n/g, ' ')} ({'\u20B9'}{dl.total?.toFixed?.(2) ?? dl.total})
+              </span>
+            ))}
+          </div>
+        )}
+
         {reviewData.ignoredLines?.length > 0 && (
           <div className="excluded-lines">
             <strong>Excluded:</strong>
@@ -1050,7 +1136,7 @@ export default function BillsTab({ session, onNavigate }) {
           </div>
           <div style={{ display: 'flex', gap: 12 }}>
             <button className="btn-secondary" onClick={() => history.back()}>Cancel</button>
-            <button className="btn-primary" disabled={saving || unmappedCount > 0} onClick={confirmBill}>
+            <button className="btn-primary" disabled={saving || unmappedCount > 0 || reviewData.lineItems.length === 0} onClick={confirmBill}>
               {saving ? 'Saving...' : editingBillId ? 'Update Bill' : 'Confirm & Save Bill'}
             </button>
           </div>

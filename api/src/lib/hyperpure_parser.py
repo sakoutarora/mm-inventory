@@ -4,9 +4,14 @@ Uses pdfplumber to extract line items from challan and invoice tables.
 
 Supports two PDF types:
   - Challan: single-page with category headers, pre-tax totals, discounts
-  - Invoice (TAX INVOICE): may be multi-page combined PDF; only TAX INVOICE
-    pages are parsed (BILL OF SUPPLY pages are ignored). No pre-tax/discount
-    columns; tax rate/amount use CGST+SGST+IGST format.
+  - Invoice: often a multi-page combined PDF holding both a TAX INVOICE
+    (taxable goods) and a BILL OF SUPPLY (GST-exempt goods) for the same
+    order. Every document page is parsed and the items merged. No
+    pre-tax/discount columns; tax rate/amount use CGST+SGST+IGST format.
+
+Exact-duplicate rows (same description, HSN, qty, unit price and total) are
+collapsed to one and reported under duplicateLines. The same product at a
+different qty or price stays as its own line.
 
 The main entry point parse_hyperpure_pdf auto-detects the type.
 """
@@ -22,6 +27,9 @@ _EXCLUDED_DESCRIPTIONS = {"delivery charge", "delivery charges", "tcs u/s 206c(1
 _EXCLUDED_HSN = {"996819", "999799"}
 # Summary rows to skip entirely (not charges, just totals)
 _SUMMARY_DESCRIPTIONS = {"total"}
+
+# Serial-number header cells that mark the line-item table header row
+_INVOICE_HEADER_LABELS = frozenset({"s no.", "s no", "sl no.", "sl no", "si no.", "si no", "si\nno."})
 
 # Category headers are rows where most cells are empty
 _CATEGORY_HEADER_PATTERN = re.compile(
@@ -47,9 +55,12 @@ def parse_hyperpure_pdf(pdf_bytes: bytes) -> dict:
         pdf.close()
         raise ValueError("PDF has no pages")
 
-    # Auto-detect: check first page text for invoice indicators
-    first_page_text = pdf.pages[0].extract_text() or ""
-    is_invoice = "TAX INVOICE" in first_page_text.upper() or "BILL OF SUPPLY" in first_page_text.upper()
+    # Auto-detect: any page carrying an invoice banner makes this an invoice PDF
+    is_invoice = any(
+        marker in ((page.extract_text() or "").upper())
+        for page in pdf.pages
+        for marker in ("TAX INVOICE", "BILL OF SUPPLY")
+    )
     pdf.close()
 
     if is_invoice:
@@ -81,6 +92,8 @@ def _parse_hyperpure_challan_pdf(pdf_bytes: bytes) -> dict:
 
     line_items = []
     ignored_lines = []
+    duplicate_lines = []
+    seen_rows = set()
     sl_no = 0
 
     # Detect column layout from the header row
@@ -125,6 +138,19 @@ def _parse_hyperpure_challan_pdf(pdf_bytes: bytes) -> dict:
         if description_lower in _SUMMARY_DESCRIPTIONS:
             continue
 
+        # Dedup before routing, so a repeated document cannot double-count a
+        # charge via ignoredLines either.
+        fingerprint = _row_fingerprint(parsed)
+        if fingerprint in seen_rows:
+            duplicate_lines.append({
+                "description": parsed["description"],
+                "quantity": parsed.get("quantity"),
+                "total": parsed.get("total", 0),
+                "reason": "Duplicate of an earlier line",
+            })
+            continue
+        seen_rows.add(fingerprint)
+
         # Check exclusions
         if description_lower in _EXCLUDED_DESCRIPTIONS:
             ignored_lines.append({
@@ -165,6 +191,7 @@ def _parse_hyperpure_challan_pdf(pdf_bytes: bytes) -> dict:
         "billMeta": bill_meta,
         "lineItems": line_items,
         "ignoredLines": ignored_lines,
+        "duplicateLines": duplicate_lines,
         "totals": totals,
     }
 
@@ -351,6 +378,23 @@ def _parse_line_item_row(cells: list[str], col_map: dict | None = None) -> dict 
     }
 
 
+def _row_fingerprint(item: dict) -> tuple:
+    """Identity of a line item for exact-duplicate detection.
+
+    Only an all-fields match counts as a duplicate: the same product bought
+    twice on one bill at a different quantity or price is a real second line,
+    not a duplicate. This catches a document that got repeated inside a
+    combined PDF, which is the case that actually produces double-counting.
+    """
+    return (
+        re.sub(r"\s+", " ", item.get("description", "")).strip().lower(),
+        item.get("hsnCode"),
+        item.get("quantity"),
+        item.get("unitPrice"),
+        item.get("total"),
+    )
+
+
 def _parse_tax_rate(rate_str: str) -> dict:
     """Parse tax rate string like '2.5+2.5+0+0' into component rates."""
     result = {"cgst": 0.0, "sgst": 0.0, "igst": 0.0, "cess": 0.0}
@@ -382,62 +426,138 @@ def _parse_tax_rate(rate_str: str) -> dict:
 def parse_hyperpure_invoice_pdf(pdf_bytes: bytes) -> dict:
     """Parse a Hyperpure invoice PDF and return structured bill data.
 
-    Only processes pages marked as TAX INVOICE. BILL OF SUPPLY pages are
-    ignored. If no TAX INVOICE page is found, raises ValueError.
+    A downloaded Hyperpure PDF is often a *combined* document: Zomato splits a
+    single order into one TAX INVOICE (taxable goods) plus one BILL OF SUPPLY
+    (GST-exempt goods such as fresh produce and meat), and a long document
+    continues onto further pages without repeating its header.
+
+    Every page is therefore parsed and the line items concatenated, with
+    slNo renumbered continuously across the whole PDF. A page with no
+    document banner is treated as a continuation of the previous document.
 
     Returns:
         dict with keys: billMeta, lineItems, ignoredLines, totals
     """
     pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
 
-    if not pdf.pages:
+    try:
+        if not pdf.pages:
+            raise ValueError("PDF has no pages")
+
+        line_items: list[dict] = []
+        ignored_lines: list[dict] = []
+        duplicate_lines: list[dict] = []
+        seen_rows: set = set()
+        documents: list[dict] = []
+        primary_meta = None
+        fallback_meta = None
+        current_doc_type = None
+        current_col_map = None
+        sl_no = 0
+
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            upper = text.upper()
+
+            if "TAX INVOICE" in upper:
+                page_doc_type = "invoice"
+            elif "BILL OF SUPPLY" in upper:
+                page_doc_type = "bill_of_supply"
+            else:
+                # Continuation page of the document that started earlier.
+                page_doc_type = None
+
+            if page_doc_type is not None:
+                current_doc_type = page_doc_type
+                # A new document restarts the table, so re-detect its columns.
+                current_col_map = None
+                meta = _extract_invoice_meta(text)
+                meta["documentType"] = page_doc_type
+                documents.append({
+                    "documentType": page_doc_type,
+                    "invoiceNumber": meta.get("invoiceNumber"),
+                })
+                if fallback_meta is None:
+                    fallback_meta = meta
+                # The TAX INVOICE carries the canonical invoice number.
+                if page_doc_type == "invoice" and primary_meta is None:
+                    primary_meta = meta
+            elif current_doc_type is None:
+                # Cover page / anything before the first document banner.
+                continue
+
+            tables = page.extract_tables()
+            if not tables:
+                continue
+
+            main_table = max(tables, key=len)
+
+            detected = _find_invoice_col_map(main_table)
+            if detected:
+                current_col_map = detected
+
+            sl_no = _collect_invoice_rows(
+                main_table, current_col_map, current_doc_type,
+                sl_no, line_items, ignored_lines, duplicate_lines, seen_rows,
+            )
+
+        if not documents:
+            raise ValueError("No TAX INVOICE or BILL OF SUPPLY page found in PDF")
+
+        bill_meta = dict(primary_meta or fallback_meta)
+        bill_meta["documents"] = documents
+
+        items_total = sum(i.get("total", 0) for i in line_items)
+        other_charges = sum(il.get("total", 0) for il in ignored_lines)
+        totals = {
+            "taxableAmount": sum(i.get("taxableAmount", 0) for i in line_items),
+            "taxAmount": sum(i.get("taxAmount", 0) for i in line_items),
+            "itemsTotal": round(items_total, 2),
+            "otherCharges": round(other_charges, 2),
+            "grandTotal": round(items_total + other_charges, 2),
+        }
+
+        return {
+            "billMeta": bill_meta,
+            "lineItems": line_items,
+            "ignoredLines": ignored_lines,
+            "duplicateLines": duplicate_lines,
+            "totals": totals,
+        }
+    finally:
         pdf.close()
-        raise ValueError("PDF has no pages")
 
-    # Find the first TAX INVOICE page
-    invoice_page = None
-    for page in pdf.pages:
-        text = page.extract_text() or ""
-        if "TAX INVOICE" in text.upper():
-            invoice_page = page
-            break
 
-    if invoice_page is None:
-        pdf.close()
-        raise ValueError("No TAX INVOICE page found in PDF")
-
-    full_text = invoice_page.extract_text() or ""
-    bill_meta = _extract_invoice_meta(full_text)
-
-    tables = invoice_page.extract_tables()
-    if not tables:
-        pdf.close()
-        raise ValueError("No tables found in invoice PDF")
-
-    main_table = max(tables, key=len)
-
-    line_items = []
-    ignored_lines = []
-    sl_no = 0
-
-    # Detect column layout from the header row
-    col_map = None
-    for row in main_table:
+def _find_invoice_col_map(table: list[list]) -> dict | None:
+    """Return the column map from a table's header row, or None if absent."""
+    for row in table:
         if not row:
             continue
         cells = [str(c).strip().lower() if c else "" for c in row]
-        if any(c in ("s no.", "s no", "sl no.", "si no.", "si\nno.") for c in cells):
-            col_map = _detect_invoice_column_map(cells)
-            break
+        if any(c in _INVOICE_HEADER_LABELS for c in cells):
+            return _detect_invoice_column_map(cells)
+    return None
 
-    for row in main_table:
+
+def _collect_invoice_rows(
+    table: list[list],
+    col_map: dict | None,
+    doc_type: str | None,
+    sl_no: int,
+    line_items: list[dict],
+    ignored_lines: list[dict],
+    duplicate_lines: list[dict],
+    seen: set,
+) -> int:
+    """Parse one page's table, appending results in place. Returns the new slNo."""
+    for row in table:
         if not row or all(not cell or not str(cell).strip() for cell in row):
             continue
 
         cells = [str(c).strip() if c else "" for c in row]
 
         # Skip header row
-        if cells[0].lower() in ("s no.", "s no", "sl no.", "si no.", "si\nno."):
+        if cells[0].lower() in _INVOICE_HEADER_LABELS:
             continue
 
         # Skip section headers like "Other Charges"
@@ -455,18 +575,24 @@ def parse_hyperpure_invoice_pdf(pdf_bytes: bytes) -> dict:
 
         description_lower = parsed["description"].lower().strip()
 
+        # Per-document "Total" row — a subtotal, not a charge.
         if description_lower in _SUMMARY_DESCRIPTIONS:
             continue
 
-        if description_lower in _EXCLUDED_DESCRIPTIONS:
-            ignored_lines.append({
+        # Dedup before routing, so a repeated document cannot double-count a
+        # charge via ignoredLines either.
+        fingerprint = _row_fingerprint(parsed)
+        if fingerprint in seen:
+            duplicate_lines.append({
                 "description": parsed["description"],
+                "quantity": parsed.get("quantity"),
                 "total": parsed.get("total", 0),
-                "reason": "Non-inventory charge",
+                "reason": "Duplicate of an earlier line",
             })
             continue
+        seen.add(fingerprint)
 
-        if parsed.get("hsnCode") in _EXCLUDED_HSN:
+        if description_lower in _EXCLUDED_DESCRIPTIONS or parsed.get("hsnCode") in _EXCLUDED_HSN:
             ignored_lines.append({
                 "description": parsed["description"],
                 "total": parsed.get("total", 0),
@@ -476,26 +602,10 @@ def parse_hyperpure_invoice_pdf(pdf_bytes: bytes) -> dict:
 
         sl_no += 1
         parsed["slNo"] = sl_no
+        parsed["documentType"] = doc_type
         line_items.append(parsed)
 
-    items_total = sum(i.get("total", 0) for i in line_items)
-    other_charges = sum(il.get("total", 0) for il in ignored_lines)
-    totals = {
-        "taxableAmount": sum(i.get("taxableAmount", 0) for i in line_items),
-        "taxAmount": sum(i.get("taxAmount", 0) for i in line_items),
-        "itemsTotal": items_total,
-        "otherCharges": other_charges,
-        "grandTotal": items_total + other_charges,
-    }
-
-    pdf.close()
-
-    return {
-        "billMeta": bill_meta,
-        "lineItems": line_items,
-        "ignoredLines": ignored_lines,
-        "totals": totals,
-    }
+    return sl_no
 
 
 def _extract_invoice_meta(text: str) -> dict:
@@ -546,7 +656,7 @@ def _detect_invoice_column_map(header_cells: list[str]) -> dict:
     col_map = {}
     for i, cell in enumerate(header_cells):
         c = cell.lower().replace("\n", " ").strip()
-        if c in ("s no.", "s no", "sl no.", "si no.", "si no"):
+        if c in _INVOICE_HEADER_LABELS:
             col_map["s_no"] = i
         elif "description" in c:
             col_map["description"] = i
